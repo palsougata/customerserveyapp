@@ -1,6 +1,5 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -11,30 +10,34 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Database setup with in-memory fallback for Vercel
 let db: any;
 let isInMemory = false;
+let mockStore: any[] = []; // Fallback if SQLite completely fails
 
-try {
-  // Vercel's filesystem is read-only, so we try /tmp or fallback to memory
-  const dbPath = process.env.VERCEL ? ":memory:" : "survey.db";
-  db = new Database(dbPath);
-  if (dbPath === ":memory:") isInMemory = true;
-  console.log(`Using ${isInMemory ? "in-memory" : "file-based"} database`);
-} catch (e) {
-  console.error("SQLite failed, falling back to in-memory", e);
-  db = new Database(":memory:");
-  isInMemory = true;
+async function initDb() {
+  try {
+    const { default: Database } = await import("better-sqlite3");
+    const dbPath = process.env.VERCEL ? ":memory:" : "survey.db";
+    db = new Database(dbPath);
+    if (dbPath === ":memory:") isInMemory = true;
+    console.log(`Using ${isInMemory ? "in-memory" : "file-based"} database`);
+    
+    // Initialize Database
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS surveys (
+        id TEXT PRIMARY KEY,
+        contact TEXT NOT NULL,
+        type TEXT NOT NULL,
+        rating INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME
+      )
+    `);
+  } catch (e) {
+    console.error("SQLite failed to initialize, using mock store", e);
+    db = null; // Mark as failed
+  }
 }
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS surveys (
-    id TEXT PRIMARY KEY,
-    contact TEXT NOT NULL,
-    type TEXT NOT NULL,
-    rating INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-  )
-`);
+initDb();
 
 const app = express();
 app.use(express.json());
@@ -52,8 +55,19 @@ app.post("/api/surveys", (req, res) => {
   }
 
   const id = uuidv4();
-  const stmt = db.prepare("INSERT INTO surveys (id, contact, type) VALUES (?, ?, ?)");
-  stmt.run(id, contact, type);
+  const newSurvey = { id, contact, type, rating: null, created_at: new Date().toISOString(), completed_at: null };
+
+  if (db) {
+    try {
+      const stmt = db.prepare("INSERT INTO surveys (id, contact, type) VALUES (?, ?, ?)");
+      stmt.run(id, contact, type);
+    } catch (err) {
+      console.error("DB Insert failed", err);
+      mockStore.push(newSurvey);
+    }
+  } else {
+    mockStore.push(newSurvey);
+  }
 
   const surveyLink = `${getAppUrl(req)}/survey/${id}`;
   console.log(`[MOCK SEND] Sending ${type} to ${contact}: ${surveyLink}`);
@@ -62,8 +76,17 @@ app.post("/api/surveys", (req, res) => {
 });
 
 app.get("/api/surveys/:id", (req, res) => {
-  const stmt = db.prepare("SELECT * FROM surveys WHERE id = ?");
-  const survey = stmt.get(req.params.id);
+  let survey;
+  if (db) {
+    try {
+      const stmt = db.prepare("SELECT * FROM surveys WHERE id = ?");
+      survey = stmt.get(req.params.id);
+    } catch (err) {
+      survey = mockStore.find(s => s.id === req.params.id);
+    }
+  } else {
+    survey = mockStore.find(s => s.id === req.params.id);
+  }
   
   if (!survey) {
     return res.status(404).json({ error: "Survey not found" });
@@ -77,10 +100,30 @@ app.post("/api/surveys/:id/submit", (req, res) => {
     return res.status(400).json({ error: "Invalid rating" });
   }
 
-  const stmt = db.prepare("UPDATE surveys SET rating = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?");
-  const result = stmt.run(rating, req.params.id);
+  let success = false;
+  if (db) {
+    try {
+      const stmt = db.prepare("UPDATE surveys SET rating = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?");
+      const result = stmt.run(rating, req.params.id);
+      success = result.changes > 0;
+    } catch (err) {
+      const s = mockStore.find(s => s.id === req.params.id);
+      if (s) {
+        s.rating = rating;
+        s.completed_at = new Date().toISOString();
+        success = true;
+      }
+    }
+  } else {
+    const s = mockStore.find(s => s.id === req.params.id);
+    if (s) {
+      s.rating = rating;
+      s.completed_at = new Date().toISOString();
+      success = true;
+    }
+  }
 
-  if (result.changes === 0) {
+  if (!success) {
     return res.status(404).json({ error: "Survey not found" });
   }
 
@@ -88,20 +131,45 @@ app.post("/api/surveys/:id/submit", (req, res) => {
 });
 
 app.get("/api/stats", (req, res) => {
-  const stmt = db.prepare("SELECT COUNT(*) as total, AVG(rating) as avgRating FROM surveys WHERE rating IS NOT NULL");
-  res.json(stmt.get());
+  if (db) {
+    try {
+      const stmt = db.prepare("SELECT COUNT(*) as total, AVG(rating) as avgRating FROM surveys WHERE rating IS NOT NULL");
+      return res.json(stmt.get());
+    } catch (err) {
+      // Fallback to mockStore stats
+    }
+  }
+  
+  const completed = mockStore.filter(s => s.rating !== null);
+  const total = completed.length;
+  const avgRating = total > 0 ? completed.reduce((acc, s) => acc + (s.rating || 0), 0) / total : 0;
+  res.json({ total, avgRating });
 });
 
 // Admin Routes
 app.get("/api/admin/surveys", (req, res) => {
-  const stmt = db.prepare("SELECT * FROM surveys ORDER BY created_at DESC");
-  const surveys = stmt.all();
-  res.json(surveys);
+  if (db) {
+    try {
+      const stmt = db.prepare("SELECT * FROM surveys ORDER BY created_at DESC");
+      return res.json(stmt.all());
+    } catch (err) {
+      // Fallback
+    }
+  }
+  res.json([...mockStore].reverse());
 });
 
 app.delete("/api/admin/surveys/:id", (req, res) => {
-  const stmt = db.prepare("DELETE FROM surveys WHERE id = ?");
-  stmt.run(req.params.id);
+  if (db) {
+    try {
+      const stmt = db.prepare("DELETE FROM surveys WHERE id = ?");
+      stmt.run(req.params.id);
+    } catch (err) {
+      mockStore = mockStore.filter(s => s.id !== req.params.id);
+    }
+  } else {
+    mockStore = mockStore.filter(s => s.id !== req.params.id);
+  }
   res.json({ success: true });
 });
 
