@@ -1,0 +1,5 @@
+{
+  "name": "SurveyPulse POC",
+  "description": "A post-call survey system for call centers with SMS/Email delivery and promotional redirects.",
+  "requestFramePermissions": []
+}
